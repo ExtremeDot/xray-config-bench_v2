@@ -64,7 +64,7 @@ run.bat
 رابط گرافیکی:
 
 ```bat
-gui.bat
+Windows GUI.bat
 ```
 
 ### لینوکس / مک
