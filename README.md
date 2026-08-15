@@ -1,6 +1,7 @@
 # بنچمارک آی‌پی کلادفلر برای XRAY
 
 
+[Readme EN](https://github.com/ExtremeDot/xray-config-bench_v2/blob/main/README_EN.md)
 
 <img width="1091" height="1029" alt="image" src="https://github.com/user-attachments/assets/fd53b355-6065-4e60-9a9f-df1e41e61608" />
 
