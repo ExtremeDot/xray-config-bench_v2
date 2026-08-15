@@ -36,7 +36,7 @@ run.bat
 **GUI:**
 
 ```bat
-gui.bat
+Windows GUI.bat
 ```
 
 or:
