@@ -35,6 +35,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.request import urlretrieve
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
@@ -141,6 +143,8 @@ def load_config() -> Dict[str, Any]:
             "logs_dir": "logs",
         },
         "excel": {"enabled": True},
+        "mode": "ip_all",
+        "config_index": 0,
         "filter": {
             "enabled": True,
             "max_latency_ms": 2000,
@@ -212,6 +216,7 @@ def progress(msg: str) -> None:
     if not cfg_get("display", "show_progress", default=True):
         return
     print(c("  ... ", Fore.BLUE) + msg, flush=True)
+    sys.stdout.flush()
 
 
 def title(msg: str) -> None:
@@ -1232,7 +1237,124 @@ def run_one(xray_path: str, parsed: Dict, cf_ip: str, remark: str) -> Dict:
     return result
 
 
+
+def run_cf_direct(cf_ip: str) -> Dict:
+    """
+    Test a Cloudflare IP without any Xray config.
+    Measures TCP connect time to :443 and optional HTTP GET to the IP (CDN-style).
+    """
+    result: Dict[str, Any] = {
+        "name": f"CF-direct | {cf_ip}",
+        "cf_ip": cf_ip,
+        "remark": "cf_direct",
+        "status": "FAIL",
+        "exit_ip": "?",
+        "loc": "?",
+        "colo": "?",
+        "lat_avg": None,
+        "lat_min": None,
+        "lat_max": None,
+        "jitter": None,
+        "loss": None,
+        "dl_avg": None,
+        "dl_min": None,
+        "dl_max": None,
+        "ul_avg": None,
+        "ul_min": None,
+        "ul_max": None,
+        "web_score": 0,
+        "insta_score": 0,
+        "gaming_score": 0,
+        "overall": 0,
+        "relay": {},
+        "port": 443,
+    }
+    progress(f"{cf_ip} | direct TCP/HTTP probe...")
+    samples = int(cfg_get("tests", "latency", "samples", default=5) or 5)
+    qto = float(cfg_get("filter", "quick_timeout_seconds", default=3) or 3)
+    max_ms = float(cfg_get("filter", "max_latency_ms", default=2000) or 2000)
+    times = []
+
+    # TCP connect samples
+    for _ in range(samples):
+        t0 = time.perf_counter()
+        try:
+            with socket.create_connection((cf_ip, 443), timeout=qto):
+                ms = (time.perf_counter() - t0) * 1000
+                times.append(ms)
+        except Exception:
+            pass
+        time.sleep(0.05)
+
+    # HTTP relay-style probes (Host-less request to IP)
+    relay_out: Dict[str, Optional[float]] = {}
+    if cfg_get("relay", "enabled", default=True):
+        sites = {
+            "HTTPS": f"https://{cf_ip}/",
+            "CF-trace": f"https://{cf_ip}/cdn-cgi/trace",
+        }
+        for name, url in sites.items():
+            st = []
+            for _ in range(int(cfg_get("relay", "samples_per_site", default=2) or 2)):
+                t0 = time.perf_counter()
+                try:
+                    r = requests.get(
+                        url,
+                        timeout=qto,
+                        headers={"Host": "cloudflare.com"},
+                        verify=False,
+                    )
+                    ms = (time.perf_counter() - t0) * 1000
+                    if r is not None:
+                        st.append(ms)
+                except Exception:
+                    pass
+                time.sleep(0.05)
+            relay_out[name] = round(statistics.mean(st), 1) if st else None
+        result["relay"] = relay_out
+
+    if not times and not any(v is not None for v in relay_out.values()):
+        result["status"] = "SKIP (unreachable)"
+        log(f"SKIP direct {cf_ip}")
+        return result
+
+    if times:
+        result["lat_avg"] = round(statistics.mean(times), 1)
+        result["lat_min"] = round(min(times), 1)
+        result["lat_max"] = round(max(times), 1)
+        result["jitter"] = round(statistics.stdev(times), 1) if len(times) > 1 else 0.0
+        result["loss"] = round((1 - len(times) / samples) * 100, 1)
+        if cfg_get("filter", "enabled", default=True) and result["lat_avg"] > max_ms:
+            result["status"] = f"SKIP (ping {result['lat_avg']}ms > {max_ms}ms)"
+            return result
+    else:
+        # use relay times as latency proxy
+        vals = [v for v in relay_out.values() if v is not None]
+        if vals:
+            result["lat_avg"] = round(statistics.mean(vals), 1)
+            result["lat_min"] = round(min(vals), 1)
+            result["lat_max"] = round(max(vals), 1)
+            result["jitter"] = 0.0
+            result["loss"] = 0.0
+
+    lat = result["lat_avg"] or 9999
+    jit = result["jitter"] or 0
+    loss = result["loss"] or 0
+    web = score_web(lat, jit, loss, None, None) if cfg_get("scoring", "web", default=True) else 0.0
+    insta = score_instagram(lat, jit, loss, None, None) if cfg_get("scoring", "instagram", default=True) else 0.0
+    gaming = score_gaming(lat, jit, loss, None, None) if cfg_get("scoring", "gaming", default=True) else 0.0
+    result["web_score"] = web
+    result["insta_score"] = insta
+    result["gaming_score"] = gaming
+    result["overall"] = score_overall(web, insta, gaming)
+    result["status"] = "OK"
+    log(f"OK direct {cf_ip} lat={result['lat_avg']} overall={result['overall']}")
+    return result
+
+
+
 def print_result(res: Dict, idx: int, total: int) -> None:
+    # ensure GUI/CLI sees each result immediately
     if not cfg_get("display", "show_live_result", default=True):
         return
     ok_status = res["status"] == "OK"
@@ -1285,6 +1407,56 @@ def print_result(res: Dict, idx: int, total: int) -> None:
 
 
 # ==================== Excel ====================
+
+def save_top_for_gui(results: List[Dict]) -> Optional[Path]:
+    """Write results/latest_top.json for the GUI top-5 panel."""
+    ok_list = [r for r in results if r.get("status") == "OK"]
+    if not ok_list:
+        # still write skips with latency if any
+        ok_list = [r for r in results if r.get("lat_avg") is not None]
+    ok_list = sorted(ok_list, key=lambda x: x.get("overall", 0) or 0, reverse=True)
+    n = int(cfg_get("ranking", "top_n", default=5) or 5)
+    top = []
+    for r in ok_list[: max(n, 5)]:
+        top.append({
+            "cf_ip": r.get("cf_ip", ""),
+            "remark": r.get("remark", ""),
+            "status": r.get("status", ""),
+            "lat_avg": r.get("lat_avg"),
+            "dl_avg": r.get("dl_avg"),
+            "ul_avg": r.get("ul_avg"),
+            "web_score": r.get("web_score", 0),
+            "insta_score": r.get("insta_score", 0),
+            "gaming_score": r.get("gaming_score", 0),
+            "overall": r.get("overall", 0),
+            "exit_ip": r.get("exit_ip", ""),
+        })
+    # also per-category tops
+    def tops(key):
+        ranked = sorted(
+            [r for r in results if r.get("status") == "OK"],
+            key=lambda x: x.get(key, 0) or 0,
+            reverse=True,
+        )[:5]
+        return [{
+            "cf_ip": r.get("cf_ip", ""),
+            "lat_avg": r.get("lat_avg"),
+            "score": r.get(key, 0),
+            "remark": r.get("remark", ""),
+        } for r in ranked]
+
+    payload = {
+        "top_overall": top,
+        "top_web": tops("web_score"),
+        "top_instagram": tops("insta_score"),
+        "top_gaming": tops("gaming_score"),
+    }
+    RESULTS_DIR.mkdir(exist_ok=True)
+    path = Path(RESULTS_DIR) / "latest_top.json"
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    ok(f"Top list for GUI: {path}")
+    return path
+
 
 def save_excel(results: List[Dict], report: str = "") -> Path:
     RESULTS_DIR.mkdir(exist_ok=True)
@@ -1376,6 +1548,8 @@ def parse_args() -> Dict[str, Any]:
         "report": "",
         "custom": False,
         "clear_temp": None,
+        "mode": None,          # ip_all | ip_one | config_only | baseline_only | cf_direct
+        "config_index": None,  # 0-based for ip_one
     }
     for a in sys.argv[1:]:
         a = a.strip()
@@ -1399,7 +1573,15 @@ def parse_args() -> Dict[str, Any]:
                 args["clear_temp"] = True
             elif v in ("0", "false", "no", "n"):
                 args["clear_temp"] = False
+        elif a.startswith("mode="):
+            args["mode"] = a.split("=", 1)[1].strip().lower()
+        elif a.startswith("config_index="):
+            try:
+                args["config_index"] = max(0, int(a.split("=", 1)[1]))
+            except ValueError:
+                pass
     return args
+
 
 
 def ask(prompt: str, default: str = "") -> str:
@@ -1463,81 +1645,144 @@ def main() -> None:
     ensure_geodata()
     print(c("-" * 64, Fore.BLUE))
 
-    baseline = measure_baseline()
+    # ---- run mode ----
+    cli_has_mode = any(a.startswith("mode=") for a in sys.argv[1:])
+    mode = args.get("mode") if cli_has_mode else str(cfg_get("mode", default="ip_all") or "ip_all")
+    mode = (mode or "ip_all").strip().lower()
+    valid_modes = ("ip_all", "ip_one", "config_only", "baseline_only", "cf_direct")
+    if mode not in valid_modes:
+        warn(f"Unknown mode={mode}, falling back to ip_all")
+        mode = "ip_all"
+    info(f"Run mode: {mode}")
+
+    config_index = args.get("config_index")
+    if config_index is None:
+        try:
+            config_index = int(cfg_get("config_index", default=0) or 0)
+        except Exception:
+            config_index = 0
 
     cfip_path = SCRIPT_DIR / str(cfg_get("paths", "cfip_file", default="cfip.txt"))
     links_path = SCRIPT_DIR / str(cfg_get("paths", "links_file", default="links.txt"))
-    cf_ips = load_cf_ips(cfip_path, max_ips)
-    links = load_links(links_path)
-    if not cf_ips or not links:
-        err("Need valid cfip.txt and links.txt")
-        sys.exit(1)
 
-    parsed_list: List[Tuple[str, Dict]] = []
-    for link in links:
-        p = parse_link(link)
-        if p:
-            parsed_list.append((p["remark"], p))
-            ok(f"Config: {p['remark']}  ({p['address']}:{p['port']})")
-        else:
-            warn("Skipped invalid link")
-
-    if not parsed_list:
-        err("No valid configs")
-        sys.exit(1)
-
-    tasks = [(remark, parsed, ip) for remark, parsed in parsed_list for ip in cf_ips]
-    info(f"Tests={len(tasks)}  workers={workers}  IPs={len(cf_ips)}  configs={len(parsed_list)}")
-    print(c("-" * 64, Fore.BLUE))
-
-    results: List[Dict] = []
-
-    if workers <= 1:
-        for i, (remark, parsed, ip) in enumerate(tasks, 1):
-            res = run_one(xray_path, parsed, ip, remark)
-            results.append(res)
-            print_result(res, i, len(tasks))
+    # Baseline: always for baseline_only; otherwise if enabled in config
+    if mode == "baseline_only":
+        # force baseline on
+        if not isinstance(CFG.get("baseline"), dict):
+            CFG["baseline"] = {}
+        CFG["baseline"]["enabled"] = True
+        baseline = measure_baseline()
+        results = [{
+            "name": "baseline | direct",
+            "cf_ip": "direct",
+            "remark": "baseline",
+            "status": "OK" if baseline.get("ok") else "FAIL (baseline)",
+            "exit_ip": "?",
+            "loc": "?",
+            "colo": "?",
+            "lat_avg": baseline.get("lat_avg"),
+            "lat_min": baseline.get("lat_avg"),
+            "lat_max": baseline.get("lat_avg"),
+            "jitter": baseline.get("jitter"),
+            "loss": baseline.get("loss"),
+            "dl_avg": baseline.get("dl_avg"),
+            "dl_min": baseline.get("dl_avg"),
+            "dl_max": baseline.get("dl_avg"),
+            "ul_avg": baseline.get("ul_avg"),
+            "ul_min": baseline.get("ul_avg"),
+            "ul_max": baseline.get("ul_avg"),
+            "web_score": baseline.get("web", 0),
+            "insta_score": baseline.get("insta", 0),
+            "gaming_score": baseline.get("gaming", 0),
+            "overall": baseline.get("overall", 0),
+            "relay": {},
+            "port": 0,
+        }]
+        # jump to summary via normal path — set empty skip of matrix
+        tasks = []
+        parsed_list = []
+        cf_ips = []
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {
-                pool.submit(run_one, xray_path, parsed, ip, remark): (remark, ip)
-                for remark, parsed, ip in tasks
-            }
-            done = 0
-            for fut in concurrent.futures.as_completed(futs):
-                done += 1
-                try:
-                    res = fut.result()
-                except Exception as e:
-                    remark, ip = futs[fut]
-                    res = {
-                        "name": f"{remark} | {ip}",
-                        "cf_ip": ip,
-                        "remark": remark,
-                        "status": f"FAIL (worker: {e})",
-                        "exit_ip": "?",
-                        "loc": "?",
-                        "colo": "?",
-                        "lat_avg": None,
-                        "lat_min": None,
-                        "lat_max": None,
-                        "jitter": None,
-                        "loss": None,
-                        "dl_avg": None,
-                        "dl_min": None,
-                        "dl_max": None,
-                        "ul_avg": None,
-                        "ul_min": None,
-                        "ul_max": None,
-                        "web_score": 0,
-                        "insta_score": 0,
-                        "gaming_score": 0,
-                        "overall": 0,
-                        "relay": {},
-                        "port": 0,
-                    }
-                results.append(res)
-                print_result(res, done, len(tasks))
+        baseline = measure_baseline()
+        cf_ips = load_cf_ips(cfip_path, max_ips) if mode in ("ip_all", "ip_one", "cf_direct") else []
+        links = load_links(links_path) if mode in ("ip_all", "ip_one", "config_only") else []
+
+        parsed_list = []
+        for link in links:
+            p = parse_link(link)
+            if p:
+                parsed_list.append((p["remark"], p))
+                ok(f"Config: {p['remark']}  ({p['address']}:{p['port']})")
+            else:
+                warn("Skipped invalid link")
+
+        if mode in ("ip_all", "ip_one", "config_only") and not parsed_list:
+            err("No valid configs in links.txt")
+            sys.exit(1)
+        if mode in ("ip_all", "ip_one", "cf_direct") and not cf_ips:
+            err("No valid targets in cfip.txt")
+            sys.exit(1)
+
+        if mode == "ip_one":
+            if config_index < 0 or config_index >= len(parsed_list):
+                err(f"config_index={config_index} out of range (0..{len(parsed_list)-1})")
+                sys.exit(1)
+            chosen = parsed_list[config_index]
+            info(f"Selected config [{config_index}]: {chosen[0]}")
+            tasks = [(chosen[0], chosen[1], ip) for ip in cf_ips]
+        elif mode == "ip_all":
+            tasks = [(remark, parsed, ip) for remark, parsed in parsed_list for ip in cf_ips]
+        elif mode == "config_only":
+            # original server address as "cf_ip" (no swap beyond original)
+            tasks = [(remark, parsed, parsed["address"]) for remark, parsed in parsed_list]
+        elif mode == "cf_direct":
+            tasks = [("cf_direct", None, ip) for ip in cf_ips]
+        else:
+            tasks = []
+
+        info(f"Tests={len(tasks)}  workers={workers}  mode={mode}")
+        print(c("-" * 64, Fore.BLUE))
+
+        results = []
+        if mode != "baseline_only" and tasks:
+            if workers <= 1:
+                for i, (remark, parsed, ip) in enumerate(tasks, 1):
+                    if mode == "cf_direct":
+                        res = run_cf_direct(ip)
+                    else:
+                        res = run_one(xray_path, parsed, ip, remark)
+                    results.append(res)
+                    print_result(res, i, len(tasks)); sys.stdout.flush()
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = {}
+                    for remark, parsed, ip in tasks:
+                        if mode == "cf_direct":
+                            futs[pool.submit(run_cf_direct, ip)] = (remark, ip)
+                        else:
+                            futs[pool.submit(run_one, xray_path, parsed, ip, remark)] = (remark, ip)
+                    done = 0
+                    for fut in concurrent.futures.as_completed(futs):
+                        done += 1
+                        try:
+                            res = fut.result()
+                        except Exception as e:
+                            remark, ip = futs[fut]
+                            res = {
+                                "name": f"{remark} | {ip}",
+                                "cf_ip": ip,
+                                "remark": remark,
+                                "status": f"FAIL (worker: {e})",
+                                "exit_ip": "?", "loc": "?", "colo": "?",
+                                "lat_avg": None, "lat_min": None, "lat_max": None,
+                                "jitter": None, "loss": None,
+                                "dl_avg": None, "dl_min": None, "dl_max": None,
+                                "ul_avg": None, "ul_min": None, "ul_max": None,
+                                "web_score": 0, "insta_score": 0, "gaming_score": 0,
+                                "overall": 0, "relay": {}, "port": 0,
+                            }
+                        results.append(res)
+                        print_result(res, done, len(tasks)); sys.stdout.flush()
 
     title("Final Ranking & Summary")
     info("All scores are out of 10  (0 = worst, 10 = best)")
@@ -1668,6 +1913,12 @@ def main() -> None:
                 warn("  Large gap vs direct — try more/cleaner CF IPs.")
         print()
         info("Score guide:  9-10 excellent | 7-8 good | 5-6 average | 3-4 weak | 0-2 poor")
+
+    # Always write a small top list for the GUI (click-to-copy)
+    try:
+        save_top_for_gui(results)
+    except Exception as e:
+        warn(f"Could not write top list for GUI: {e}")
 
     print()
     if cfg_get("excel", "enabled", default=True):
