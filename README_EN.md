@@ -1,5 +1,7 @@
 # CF Xray IP Benchmark
 
+<img width="1092" height="1022" alt="image" src="https://github.com/user-attachments/assets/5521ba78-ae31-45b8-a90f-ea32df32ad55" />
+
 Test **Cloudflare IPs** with your **Xray share-links** (`vless` / `vmess` / `trojan`), score them for **Web**, **Instagram**, and **Gaming**, and export ranked results to Excel.
 
 Inspired by [ExtremeDot/xray-config-benchmark](https://github.com/ExtremeDot/xray-config-benchmark).
